@@ -1,0 +1,7 @@
+# 코드에서 실제로 import하여 사용하는 패키지
+requests==2.32.3
+pandas==2.2.3
+python-dotenv==1.1.0
+pymysql==1.1.1
+beautifulsoup4==4.13.4
+anthropic==0.52.0

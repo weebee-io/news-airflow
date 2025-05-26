@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    # The command to run the ETL script will be handled by the Dockerfile's CMD or ENTRYPOINT
+
+volumes:
+  db_data: # Defines a named volume for persisting database data
