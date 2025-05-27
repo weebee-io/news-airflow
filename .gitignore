@@ -1,5 +1,6 @@
 # ENV
 .env
 
-#venv
-crawling_venv
+# Virtual environments
+crawling/
+crawling_venv/
