@@ -2,5 +2,7 @@
 .env
 
 # Virtual environments
-./crawling/
-./crawling_venv/
+crawling/
+crawling_venv/
+*.pyc
+__pycache__/

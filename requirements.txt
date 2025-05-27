@@ -5,3 +5,7 @@ python-dotenv==1.1.0
 pymysql==1.1.1
 beautifulsoup4==4.13.4
 anthropic==0.52.0
+newspaper3k==0.2.8
+apache-airflow==2.6.3
+apache-airflow-providers-amazon==8.2.0
+apache-airflow-providers-postgres==5.5.1
