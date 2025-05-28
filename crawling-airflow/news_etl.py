@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 import time
 import random
 import urllib.parse
+import re
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import anthropic
 from newspaper import Article
@@ -47,9 +49,68 @@ DB_NAME = os.getenv('DB_NAME')
 DB_USERNAME = os.getenv('DB_USERNAME')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 
-def fetch_naver_news():
-    """네이버 API를 통해 금융/경제 관련 뉴스 수집"""
-    logger.info("네이버 뉴스 API 데이터 수집 시작")
+
+# news_etl.py 파일에 다음 함수를 추가
+def is_first_run():
+    """최초 실행 여부를 확인"""
+    first_run_marker = os.path.join(os.path.expanduser("~"), "airflow", "first_run_completed.txt")
+    if not os.path.exists(first_run_marker):
+        # 최초 실행 시 파일 생성
+        with open(first_run_marker, "w") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        return True
+    return False
+
+def fetch_news_from_api():
+    """여러 API에서 뉴스 데이터 수집"""
+    logger.info("뉴스 데이터 수집 시작")
+    
+    # 최초 실행 여부에 따라 검색 기간 결정
+    if is_first_run():
+        logger.info("최초 실행: 최근 7일간의 뉴스 수집")
+        start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+    else:
+        logger.info("일반 실행: 최근 12시간의 뉴스 수집")
+        start_date = (datetime.now() - timedelta(hours=12)).strftime("%Y%m%d")
+    
+    end_date = datetime.now().strftime("%Y%m%d")
+    
+    # API 결과 저장
+    results = []
+    
+    try:
+        # 네이버 뉴스 API 호출 시 날짜 범위 적용
+        naver_finance = fetch_naver_news("금융", start_date=start_date, end_date=end_date)
+        if not naver_finance.empty:
+            logger.info(f"네이버 금융 뉴스: {len(naver_finance)}개 수집")
+            results.append(naver_finance)
+        
+        # 추가 뉴스 소스도 같은 방식으로 수정
+        firecrawl_news = fetch_firecrawl_news()
+        if not firecrawl_news.empty:
+            logger.info(f"Firecrawl 뉴스: {len(firecrawl_news)}개 수집")
+            results.append(firecrawl_news)
+        
+    except Exception as e:
+        logger.error(f"뉴스 수집 중 오류: {e}")
+    
+    if not results:
+        logger.warning("수집된 뉴스가 없습니다.")
+        return pd.DataFrame()
+    
+    # 수집된 결과 합치기
+    combined_df = pd.concat(results, ignore_index=True)
+    combined_df = combined_df.drop_duplicates(subset=['link'])
+    logger.info(f"총 {len(combined_df)}개의 뉴스 데이터 수집 완료")
+    
+    return combined_df
+
+
+def fetch_naver_news(query="", start_date=None, end_date=None, display=100):
+    """네이버 뉴스 API를 통해 금융/경제 관련 뉴스 수집 - 업데이트된 필터링 적용"""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        logger.error("네이버 API 키가 설정되지 않았습니다.")
+        return pd.DataFrame()
     
     url = "https://openapi.naver.com/v1/search/news.json"
     headers = {
@@ -57,50 +118,139 @@ def fetch_naver_news():
         "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
     }
     
-    # 검색어 리스트
+    # 날짜 범위 쿼리 추가
+    date_query = ""
+    if start_date and end_date:
+        date_query = f" after:{start_date} before:{end_date}"
+    
+    # 금융/경제 관련 핵심 키워드 - 더 포커스를 맞춰 업데이트
     search_terms = [
-        "금융", "경제", "주식", "투자", "은행", 
-        "금리", "채권", "외환", "글로벌 경제", "국제 금융"
+        "금융 경제", "주식 시장", "금리 정책", "경제 전망", "투자 전략",
+        "인플레이션 경제", "외환 시장", "글로벌 금융", "부동산 시장", "펀드 투자",
+        "가상화폐 시장", "재테크 전략", "기업 재무", "세금 정책", "은행 상품"
+    ]
+    
+    # 제외할 키워드 - 금융/경제와 관련 없는 뉴스 필터링
+    exclude_keywords = [
+        "연예", "엽고", "연예인", "방송", "드라마", "스포츠", "게임", "영화",
+        "정치", "사건", "사고", "범죄", "주제", "의학", "코로나", "서비스 중단"
     ]
     
     news_items = []
+    total_fetched = 0
+    included_count = 0
+    excluded_count = 0
     
     for term in search_terms:
         # 검색어 인코딩
         encText = urllib.parse.quote(term)
+        search_query = encText + date_query
+        
         params = {
-            "query": encText,
-            "display": 20,  # 한 번에 가져올 결과 수
-            "start": 1,     # 시작 위치
-            "sort": "date"  # 날짜순 정렬
+            "query": search_query,
+            "display": display,
+            "start": 1,
+            "sort": "date"  # 최신순 정렬로 변경
         }
+
+         # 날짜 범위가 있으면 추가
+        if start_date:
+            params["start_date"]
+        if end_date:
+            params["end_date"]
         
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            response = requests.get(url, headers=headers, params=params)
             
-            if "items" in data and data["items"]:
-                logger.info(f"'{term}' 검색어로 {len(data['items'])}개 뉴스 항목 수집")
-                news_items.extend(data["items"])
-            else:
-                logger.warning(f"'{term}' 검색어로 뉴스를 찾을 수 없습니다.")
+            if response.status_code == 200:
+                result = response.json()
                 
-            # API 호출 간 딜레이
-            time.sleep(0.5)
-            
+                if 'items' in result:
+                    items = result['items']
+                    total_fetched += len(items)
+                    
+                    for item in items:
+                        # HTML 태그 제거
+                        title = re.sub('<.*?>', '', item['title'])
+                        description = re.sub('<.*?>', '', item['description'])
+                        
+                        # 제외 키워드 검사 - 하나라도 있으면 제외
+                        exclude_this = False
+                        for exclude_word in exclude_keywords:
+                            if exclude_word in title.lower() or exclude_word in description.lower():
+                                exclude_this = True
+                                excluded_count += 1
+                                break
+                        
+                        if exclude_this:
+                            continue
+                            
+                        # 금융/경제 관련 키워드가 있는지 추가 확인
+                        finance_terms = ["금융", "경제", "시장", "주식", "투자", "자산", "금리",
+                                      "채권", "외환", "기업", "재무", "펀드", "세금", "정책"]
+                        
+                        has_finance_term = False
+                        for finance_term in finance_terms:
+                            if finance_term in title or finance_term in description[:100]:  # 제목이나 요약 시작 부분에 금융 키워드가 있어야 함
+                                has_finance_term = True
+                                break
+                                
+                        if not has_finance_term:
+                            excluded_count += 1
+                            continue
+                        
+                        # 네이버 뉴스 링크에서 원본 URL 추출
+                        original_url = item.get('originallink', item['link'])
+                        if not original_url or original_url == "":
+                            original_url = item['link']
+                            
+                        # 사이트 이름 추출
+                        source = ""
+                        try:
+                            url_parts = urllib.parse.urlparse(original_url)
+                            source = url_parts.netloc
+                            if source.startswith('www.'):
+                                source = source[4:]
+                        except:
+                            source = item.get('originallink', '').split('/')[2] if 'originallink' in item and '/' in item['originallink'] else ''
+                        
+                        # 발행일 형식화
+                        published_date = None
+                        try:
+                            # 네이버 뉴스 형식: Mon, 20 May 2024 09:00:00 +0900
+                            published_date = datetime.strptime(item['pubDate'], '%a, %d %b %Y %H:%M:%S %z')
+                            published_date = published_date.strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            published_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # 생성된 뉴스 아이템에 저장
+                        news_items.append({
+                            'title': title,
+                            'description': description,
+                            'url': original_url,  # 원본 URL 사용
+                            'published_date': published_date,
+                            'source': source,
+                            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        })
+                        included_count += 1
+                        print("----------------",  news_items)
+            else:
+                logger.error(f"네이버 API 오류 발생: {response.status_code}")
+                    
         except Exception as e:
-            logger.error(f"네이버 API 호출 중 오류 발생: {e}")
+            logger.error(f"네이버 뉴스 크롤링 중 오류 발생: {e}")
+            
+        # API 요청 사이 짠시 대기
+        time.sleep(0.2)
     
-    # 결과를 DataFrame으로 변환
-    if news_items:
-        df = pd.DataFrame(news_items)
-        # HTML 태그 제거
-        df['title'] = df['title'].str.replace('<[^<]+?>', '', regex=True)
-        df['description'] = df['description'].str.replace('<[^<]+?>', '', regex=True)
+    # 데이터프레임 생성
+    df = pd.DataFrame(news_items)
+    
+    if not df.empty:
         # 중복 제거
-        df = df.drop_duplicates(subset=['link'])
-        logger.info(f"총 {len(df)}개 네이버 뉴스 수집 완료")
+        df = df.drop_duplicates(subset=['url'])
+        
+        logger.info(f"총 {total_fetched}개 기사 중 {included_count}개의 금융/경제 관련 네이버 뉴스 기사를 가져왔습니다. (제외된 기사: {excluded_count}개)")
         return df
     else:
         logger.warning("수집된 뉴스가 없습니다.")
@@ -120,10 +270,11 @@ def fetch_firecrawl_news():
         "Content-Type": "application/json"
     }
     
-    # 검색어 리스트 (영어)
+    # 검색어 리스트 (영어) - 금융/경제 키워드 추가
     search_terms = [
-        "finance news", "economic news", "stock market", 
-        "investment news", "banking news", "global economy"
+        "finance news", "economic news", "stock market", "investment news", "banking news", 
+        "global economy", "financial markets", "trading", "bonds", "currency", "cryptocurrency",
+        "financial education", "monetary policy", "inflation", "financial literacy", "market analysis"
     ]
     
     news_items = []
@@ -166,8 +317,26 @@ def fetch_firecrawl_news():
         df = pd.DataFrame(news_items)
         # 중복 제거
         df = df.drop_duplicates(subset=['link'])
-        logger.info(f"총 {len(df)}개 Firecrawl 뉴스 수집 완료")
-        return df
+        
+        # 금융/경제 관련 필터링
+        finance_keywords = [
+            'finance', 'economic', 'stock', 'invest', 'bank', 'market', 'trading', 
+            'bond', 'currency', 'crypto', 'financial', 'monetary', 'inflation', 
+            'economy', 'fund', 'asset', 'wealth', 'money', 'tax'
+        ]
+        
+        # 제목이나 설명에 금융/경제 키워드가 포함된 뉴스만 필터링
+        pattern = '|'.join(finance_keywords)
+        mask = (df['title'].str.contains(pattern, case=False, na=False) | 
+                df['description'].str.contains(pattern, case=False, na=False))
+        filtered_df = df[mask]
+        
+        if len(filtered_df) > 0:
+            logger.info(f"총 {len(df)}개 중 {len(filtered_df)}개 금융/경제 관련 뉴스 필터링 완료")
+            return filtered_df
+        else:
+            logger.warning("금융/경제 관련 뉴스가 필터링 후 없습니다. 전체 뉴스 반환")
+            return df
     else:
         logger.warning("수집된 뉴스가 없습니다.")
         return pd.DataFrame()
@@ -205,22 +374,23 @@ def extract_article_with_newspaper(url):
     except Exception as e:
         logger.error(f"기사 추출 중 오류 발생 ({url}): {e}")
         return ""
-
+    
 def process_news_data(df):
     """수집된 뉴스 데이터 처리 및 기사 본문 추출"""
-    if df.empty:
-        logger.warning("처리할 데이터가 없습니다.")
-        return df
-    
-    # 데이터 전처리
-    df = df.drop_duplicates(subset=['link', 'title'])
+    logger.info(f"총 {len(df)}개 기사 본문 추출 시작")
     
     # 날짜 형식 통일
     if 'pubDate' in df.columns:
         df['pubDate'] = pd.to_datetime(df['pubDate'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
     
+    # 필드 이름 통일 (link가 없으면 url 사용)
+    if 'link' not in df.columns and 'url' in df.columns:
+        df['link'] = df['url']
+    elif 'url' not in df.columns and 'link' in df.columns:
+        df['url'] = df['link']
+        
     # 병렬로 기사 본문 추출
-    urls = df['link'].tolist()
+    urls = df['url'].tolist() if 'url' in df.columns else df['link'].tolist()
     logger.info(f"총 {len(urls)}개 기사 본문 추출 시작")
     
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -238,94 +408,137 @@ def process_news_data(df):
             except Exception as e:
                 logger.error(f"기사 {idx+1}/{len(urls)} 처리 중 오류: {e}")
     
+    # 원문 링크가 없는 기사 제외
+    original_len = len(df)
+    if 'url' in df.columns:
+        df = df[df['url'].notna() & (df['url'] != '')]
+    else:
+        df = df[df['link'].notna() & (df['link'] != '')]
+    excluded = original_len - len(df)
+    if excluded > 0:
+        logger.warning(f"원문 링크가 없는 {excluded}개 기사 제외됨. 남은 기사: {len(df)}개")
+    
     # 데이터베이스 구조에 맞게 컬럼 이름 변경
     column_mapping = {
         'title': 'title',
         'description': 'description',
         'link': 'url',
         'pubDate': 'published_date',
-        'source': 'source'
+        'source': 'source',
+        'keywords': 'keywords',
+        'summary': 'summary'
     }
+    
+    # 디버깅을 위한 컬럼 확인
+    logger.info(f"데이터프레임 컬럼: {df.columns.tolist()}")
     
     # 필요한 컬럼만 선택하고 이름 변경
     df = df.rename(columns=column_mapping)
-    df = df[list(column_mapping.values())]
+    
+    # source 컬럼이 없는 경우 URL에서 도메인 추출하여 source로 사용
+    if 'source' not in df.columns:
+        from urllib.parse import urlparse
+        df['source'] = df['url'].apply(lambda x: urlparse(x).netloc if pd.notna(x) else None)
+        logger.info("URL에서 도메인을 추출하여 source 컬럼 생성")
+    
+    # 필요한 컬럼만 선택 (만약 키워드와 요약이 없는 경우 빈 문자열로 추가)
+    base_columns = ['title', 'description', 'url', 'published_date', 'source']
+    df = df[base_columns]
+    
+    # 키워드와 요약 컬럼 추가
+    if 'keywords' not in df.columns:
+        df['keywords'] = ''
+    if 'summary' not in df.columns:
+        df['summary'] = ''
     
     # 현재 시간 추가
     df['created_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    logger.info(f"총 {len(df)}개 기사 처리 완료")
     return df
 
+
 def preprocess_news_with_claude(news_id, title, description):
-    """Claude API를 사용하여 뉴스 기사 요약 및 키워드 추출"""
+    """기사 내용을 기반으로 Claude API를 이용해 정확한 요약 및 키워드 추출"""
     if not ANTHROPIC_API_KEY:
         logger.error("Claude API 키가 설정되지 않았습니다.")
         return None
-    
+        
     if not description or len(description) < 100:
         logger.warning(f"기사 ID {news_id}의 본문이 너무 짧아 처리할 수 없습니다.")
         return None
-    
+        
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
         prompt = f"""
-        다음은 금융/경제 관련 뉴스 기사입니다:
+        당신은 금융/경제 뉴스 분석 전문가입니다. 다음 기사에서 가장 중요한 금융/경제 키워드를 추출하고, 요점을 정확하게 요약해주세요.
         
-        제목: {title}
+        기사 제목: {title}
+        기사 내용: {description[:10000]}
         
-        본문:
-        {description[:10000]}
+        이 기사에서 핵심 금융/경제 키워드 5개와 내용을 2~3문장으로 정확하게 요약해주세요.
         
-        위 기사에 대해 다음 정보를 제공해주세요:
-        1. 기사 내용을 3~4문장으로 객관적 요약
-        2. 금융 개념 키워드 5개 (고유명사 제외, 예: 금리, 자산, 소비, 재정, 통화정책)
+        1. 키워드는 기사의 핵심 금융/경제 용어나 개념을 담고 있어야 합니다.
+        2. 요약은 기사의 주요 내용과 시장에 미칠 영향이나 경제적 의의를 포함해야 합니다.
         
-        다음 JSON 형식으로 응답해주세요:
+        반드시 다음 JSON 형식으로 응답해주세요:
         {{
-            "summary": "기사 요약문",
-            "keywords": "키워드1, 키워드2, 키워드3, 키워드4, 키워드5"
+            "keywords": "키워드1, 키워드2, 키워드3, 키워드4, 키워드5",
+            "summary": "기사의 내용을 2~3문장으로 요약한 내용"
         }}
+        
+        중요: 오직 JSON 형식만 제공해주세요. 다른 텍스트나 설명은 포함하지 마세요.
         """
         
         message = client.messages.create(
-            model="claude-3-sonnet-20240229",
+            model="claude-3-7-sonnet-20250219",
             max_tokens=1000,
-            temperature=0.2,
-            system="당신은 금융/경제 뉴스를 분석하고 요약하는 AI 전문가입니다. 항상 객관적이고 정확한 정보를 제공합니다.",
+            temperature=0.0,  # 정확한 응답을 위해 낮은 온도 사용
             messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "user", "content": prompt}
             ]
         )
         
-        # 응답에서 JSON 형식 추출
+        # 응답에서 JSON 부분만 추출
         response_text = message.content[0].text
         
-        # JSON 부분만 추출
+        # JSON 형식 추출
         json_start = response_text.find('{')
-        json_end = response_text.rfind('}') + 1
+        json_end = response_text.rfind('}')
         
-        if json_start >= 0 and json_end > json_start:
-            json_str = response_text[json_start:json_end]
-            processed_data = json.loads(json_str)
+        if json_start == -1 or json_end == -1:
+            logger.error(f"기사 ID {news_id}: JSON 형식을 찾을 수 없습니다.")
+            logger.debug(f"Claude 응답: {response_text[:200]}...")
+            return None
             
-            if "summary" in processed_data and "keywords" in processed_data:
-                logger.info(f"기사 ID {news_id} 전처리 완료")
-                return processed_data
+        json_str = response_text[json_start:json_end+1]
         
-        logger.error(f"기사 ID {news_id}에 대한 전처리 응답이 유효한 JSON 형식이 아닙니다.")
-        return None
-        
+        try:
+            result = json.loads(json_str)
+            
+            # 기본값 확인 및 설정
+            if "keywords" not in result or not result["keywords"]:
+                result["keywords"] = ""
+                logger.warning(f"기사 ID {news_id}: 키워드가 없어 빈 문자열로 설정합니다.")
+                
+            if "summary" not in result or not result["summary"]:
+                result["summary"] = ""
+                logger.warning(f"기사 ID {news_id}: 요약문이 없어 빈 문자열로 설정합니다.")
+                
+            logger.info(f"기사 ID {news_id}: 키워드 및 요약 생성 완료")
+            return result
+            
+        except json.JSONDecodeError as json_err:
+            logger.error(f"기사 ID {news_id}: JSON 파싱 오류 - {json_err}")
+            logger.debug(f"JSON 데이터: {json_str[:200]}...")
+            return None
+            
     except Exception as e:
-        logger.error(f"Claude API 호출 중 오류 발생: {e}")
+        logger.error(f"기사 ID {news_id}: Claude 요약/키워드 추출 중 오류 - {e}")
         return None
 
 def generate_quiz_with_claude(news_id, title, description):
-    """Claude API를 사용하여 뉴스 기사 기반 퀴즈 생성"""
+    """Claude API를 사용하여 뉴스 기사 기반 퀴즈 생성 - 기사당 최소 3개 문제 생성"""
     if not ANTHROPIC_API_KEY:
         logger.error("Claude API 키가 설정되지 않았습니다.")
         return None
@@ -338,85 +551,115 @@ def generate_quiz_with_claude(news_id, title, description):
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
         prompt = f"""
-        당신은 경제·금융 교육을 위한 NIE 콘텐츠 제작자입니다. 아래 뉴스 기사를 분석하여, 금융 교육 콘텐츠로 변환하십시오.
+        당신은 금융/경제 교육을 위한 퀴즈 전문가입니다. 다음 기사를 기반으로 학습자들이 금융 개념을 이해할 수 있는 교육용 퀴즈를 만들어주세요.
         
-        제목: {title}
+        기사 제목: {title}
+        기사 내용: {description[:10000]}
         
-        본문:
-        {description[:10000]}
-        
-        위 기사 내용을 바탕으로 최소 3개의 퀴즈를 생성해주세요. 각 퀴즈는 다음 형식을 따라야 합니다:
-        
-        1. newsquiz_content: 키워드 중 하나에 대한 금융지식/이해력 관련 질문 (개념 응용 또는 이해 중심, 고유명사 사용 금지)
-        2. newsquiz_choice_a~d: 객관식 보기 4개
-        3. newsquiz_correct_ans: 정답 보기 (a, b, c, d 중 하나)
-        4. newsquiz_score: EASY=30 / NORMAL=60 / HARD=100
-        5. newsquiz_level: 난이도 (EASY / NORMAL / HARD)
-        6. reason: 난이도 판정 근거
-        
-        난이도 분류 기준:
-        - "EASY": 개념 정의 또는 직접적인 결과
-        - "NORMAL": 개념 간 연관성 또는 원인-결과 이해
-        - "HARD": 정책 변화, 구조적 추론, 간접적 응용 필요
-        
+        이 기사의 주요 금융/경제 개념을 이해하기 위한 객관식 퀴즈를 제작해주세요. 반드시 최소 3개 이상의 퀴즈를 제작하고, 다음 형식을 정확히 따라주세요.
+
         다음 JSON 형식으로 응답해주세요:
         {{
             "quizzes": [
                 {{
-                    "newsquiz_content": "질문 내용",
-                    "newsquiz_choice_a": "보기 1",
-                    "newsquiz_choice_b": "보기 2",
-                    "newsquiz_choice_c": "보기 3",
-                    "newsquiz_choice_d": "보기 4",
-                    "newsquiz_correct_ans": "정답 보기(a, b, c, d 중 하나)",
-                    "newsquiz_score": 난이도에 따른 점수,
-                    "newsquiz_level": "난이도",
-                    "reason": "난이도 판정 근거"
+                    "newsquiz_content": "퀴즈 질문",
+                    "newsquiz_choice_a": "선택지 A",
+                    "newsquiz_choice_b": "선택지 B",
+                    "newsquiz_choice_c": "선택지 C",
+                    "newsquiz_choice_d": "선택지 D",
+                    "newsquiz_correct_ans": "A", # A, B, C, D 중 하나
+                    "newsquiz_score": 5, # 1~10사이 숫자
+                    "newsquiz_level": "medium", # easy, medium, hard 중 하나
+                    "reason": "정답 이유 설명"
                 }},
-                ...
+                # 추가 퀴즈...
             ]
         }}
+        
+        중요: 반드시 최소 3개 이상의 퀴즈를 제작해야 합니다. 각 퀴즈는 다양한 난이도와 주제를 다루어야 합니다.
         """
         
         message = client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=2000,
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=4000,
             temperature=0.7,
-            system="당신은 금융/경제 뉴스를 분석하고 교육적인 퀴즈를 생성하는 AI 전문가입니다. 항상 난이도를 적절히 분류하고 교육적 가치가 있는 문제를 출제합니다.",
             messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "user", "content": prompt}
             ]
         )
         
-        # 응답에서 JSON 형식 추출
+        # 응답에서 JSON 부분만 추출
         response_text = message.content[0].text
         
-        # JSON 부분만 추출
+        # JSON 형식 추출
         json_start = response_text.find('{')
-        json_end = response_text.rfind('}') + 1
+        json_end = response_text.rfind('}')
         
-        if json_start >= 0 and json_end > json_start:
-            json_str = response_text[json_start:json_end]
+        if json_start == -1 or json_end == -1:
+            logger.error(f"기사 ID {news_id}: JSON 형식을 찾을 수 없습니다.")
+            logger.debug(f"Claude 응답: {response_text[:200]}...")
+            return None
+            
+        json_str = response_text[json_start:json_end+1]
+        
+        try:
             quiz_data = json.loads(json_str)
             
-            if "quizzes" in quiz_data and len(quiz_data["quizzes"]) > 0:
-                logger.info(f"기사 ID {news_id}에 대한 {len(quiz_data['quizzes'])}개 퀴즈 생성 완료")
-                return quiz_data
-        
-        logger.error(f"기사 ID {news_id}에 대한 퀴즈 생성 응답이 유효한 JSON 형식이 아닙니다.")
-        return None
-        
+            # 최소 3개 이상의 퀴즈가 있는지 확인
+            if "quizzes" not in quiz_data or len(quiz_data["quizzes"]) < 3:
+                logger.warning(f"기사 ID {news_id}: 퀴즈가 3개 미만입니다. (생성된 퀴즈: {len(quiz_data.get('quizzes', []))}개)")
+                # 부족하지만 있는 퀴즈라도 반환
+            
+            # 각 퀴즈의 필수 필드 확인
+            required_fields = [
+                "newsquiz_content", "newsquiz_choice_a", "newsquiz_choice_b", 
+                "newsquiz_choice_c", "newsquiz_choice_d", "newsquiz_correct_ans", 
+                "newsquiz_score", "newsquiz_level", "reason"
+            ]
+            
+            valid_quizzes = []
+            for idx, quiz in enumerate(quiz_data.get("quizzes", [])):
+                missing_fields = [f for f in required_fields if f not in quiz]
+                
+                if missing_fields:
+                    logger.warning(f"기사 ID {news_id}: 퀴즈 #{idx+1}에 필수 필드 {missing_fields}가 없습니다.")
+                    # 필드 값 추가
+                    for field in missing_fields:
+                        if field == "newsquiz_score":
+                            quiz[field] = 5  # 기본값 5
+                        elif field == "newsquiz_level":
+                            quiz[field] = "medium"  # 기본값 medium
+                        elif field == "newsquiz_correct_ans":
+                            quiz[field] = "A"  # 기본값 A
+                        else:
+                            quiz[field] = ""  # 다른 필드는 빈 문자열
+                
+                # 정답 형식 검사 (A, B, C, D 중 하나여야 함)
+                if quiz["newsquiz_correct_ans"] not in ["A", "B", "C", "D"]:
+                    logger.warning(f"기사 ID {news_id}: 퀴즈 #{idx+1}의 정답이 잘못되었습니다: {quiz['newsquiz_correct_ans']}")
+                    # A로 바꾸기
+                    quiz["newsquiz_correct_ans"] = "A"
+                
+                valid_quizzes.append(quiz)
+            
+            # 유효한 퀴즈만 저장
+            quiz_data["quizzes"] = valid_quizzes
+            
+            return quiz_data
+            
+        except json.JSONDecodeError as json_err:
+            logger.error(f"기사 ID {news_id}: JSON 파싱 오류 - {json_err}")
+            logger.debug(f"JSON 데이터: {json_str[:200]}...")
+            return None
+            
     except Exception as e:
-        logger.error(f"Claude API 호출 중 오류 발생: {e}")
+        logger.error(f"기사 ID {news_id}: Claude 퀴즈 생성 중 오류 - {e}")
         return None
 
 def save_news_to_database(df):
-    """뉴스 데이터를 MySQL 데이터베이스에 저장"""
+    """뉴스 데이터프레임을 데이터베이스에 저장 - 중복 기사 확인 및 새 기사만 추가"""
     if df.empty:
-        logger.warning("저장할 데이터가 없습니다.")
+        logger.warning("저장할 뉴스 데이터가 없습니다.")
         return []
     
     try:
@@ -429,46 +672,74 @@ def save_news_to_database(df):
         )
         
         cursor = conn.cursor()
-        news_ids = []
         
+        # 데이터베이스에 추가할 뉴스 ID를 저장할 목록
+        inserted_news_ids = []
+        total_articles = len(df)
+        skipped_articles = 0
+        
+        # 기사 해시값 및 URL 저장을 위한 집합
+        article_hashes = set()
+        article_urls = set()
+        
+        # 기존 기사 해시 및 URL 로드
+        cursor.execute("SELECT article_hash, url FROM news")
+        existing_data = cursor.fetchall()
+        for hash_val, url in existing_data:
+            article_hashes.add(hash_val)
+            article_urls.add(url)
+            
         for _, row in df.iterrows():
-            # 뉴스 기사 저장
-            cursor.execute('''
-                INSERT INTO news 
-                (title, description, url, published_date, source, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                description = VALUES(description),
-                source = VALUES(source),
-                published_date = VALUES(published_date)
-            ''', (
-                row['title'], 
-                row['description'], 
-                row['url'], 
-                row['published_date'], 
-                row['source'], 
-                row['created_at']
-            ))
+            title = row['title'] if not pd.isna(row['title']) else ''
+            description = row['description'] if not pd.isna(row['description']) else ''
+            created_at = row['created_at'] if not pd.isna(row['created_at']) else None
+            source = row['source'] if not pd.isna(row['source']) else ''
+            url = row['url'] if not pd.isna(row['url']) else ''
+            keywords = row['keywords'] if 'keywords' in row and not pd.isna(row['keywords']) else ''
+            summary = row['summary'] if 'summary' in row and not pd.isna(row['summary']) else ''
             
-            # 삽입된 기사의 ID 가져오기
-            news_id = cursor.lastrowid
-            if not news_id:
-                # 이미 존재하는 기사의 경우 ID 조회
-                cursor.execute('SELECT news_id FROM news WHERE url = %s', (row['url'],))
-                result = cursor.fetchone()
-                if result:
-                    news_id = result[0]
+            # 중복 여부 확인 (URL 및 해시 기반)
+            article_hash = hashlib.md5(url.encode()).hexdigest()
             
-            if news_id:
-                news_ids.append(news_id)
+            # 이미 저장된 기사인지 검사 (해시 또는 URL 기반)
+            if article_hash in article_hashes or url in article_urls:
+                logger.info(f"중복 기사 건너뜀: {title[:30]}...")
+                skipped_articles += 1
+                continue
+                
+            # 스키마 중 keywords, summary 컬럼이 아직 없는 경우에는 에러를 발생할 수 있음
+            try:
+                cursor.execute('''
+                    INSERT INTO news 
+                    (title, description, created_at, source, url, article_hash, keywords, summary)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    title, description, created_at, source, url, article_hash, keywords, summary
+                ))
+                
+                # 방금 삽입한 레코드의 ID 가져오기
+                news_id = cursor.lastrowid
+                inserted_news_ids.append(news_id)
+                
+                # 해시와 URL 등록
+                article_hashes.add(article_hash)
+                article_urls.add(url)
+                
+                logger.debug(f"기사 저장 성공 (ID: {news_id}): {title[:30]}...")
+                
+            except Exception as insert_error:
+                logger.error(f"기사 저장 중 오류 발생: {insert_error}")
+                # 개별 기사 저장 실패가 전체 처리를 막지 않도록 함
+                continue
         
+        # 변경사항 적용
         conn.commit()
-        logger.info(f"{len(news_ids)}개 기사 데이터베이스 저장 완료")
         
         cursor.close()
         conn.close()
         
-        return news_ids
+        logger.info(f"총 {total_articles}개 중 {len(inserted_news_ids)}개의 새 기사가 데이터베이스에 저장되었습니다. (중복 건너뜀: {skipped_articles}개)")
+        return inserted_news_ids
         
     except Exception as e:
         logger.error(f"데이터베이스 저장 중 오류 발생: {e}")
@@ -515,10 +786,10 @@ def update_news_with_claude_data(news_id, processed_data):
         return False
 
 def save_quiz_to_database(news_id, quiz_data):
-    """생성된 퀴즈를 데이터베이스에 저장"""
+    """생성된 퀴즈를 데이터베이스에 저장하고 저장된 퀴즈 수 반환"""
     if not quiz_data or "quizzes" not in quiz_data:
         logger.warning(f"기사 ID {news_id}에 대한 퀴즈 데이터가 없습니다.")
-        return False
+        return 0
     
     try:
         conn = pymysql.connect(
@@ -530,42 +801,48 @@ def save_quiz_to_database(news_id, quiz_data):
         )
         
         cursor = conn.cursor()
+        saved_count = 0
         
         for quiz in quiz_data["quizzes"]:
-            # 퀴즈 저장
-            cursor.execute('''
-                INSERT INTO news_quiz 
-                (news_id, newsquiz_content, newsquiz_choice_a, newsquiz_choice_b, 
-                newsquiz_choice_c, newsquiz_choice_d, newsquiz_correct_ans, 
-                newsquiz_score, newsquiz_level, reason)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                news_id,
-                quiz["newsquiz_content"],
-                quiz["newsquiz_choice_a"],
-                quiz["newsquiz_choice_b"],
-                quiz["newsquiz_choice_c"],
-                quiz["newsquiz_choice_d"],
-                quiz["newsquiz_correct_ans"],
-                quiz["newsquiz_score"],
-                quiz["newsquiz_level"],
-                quiz["reason"]
-            ))
+            try:
+                # 퀴즈 저장
+                cursor.execute('''
+                    INSERT INTO news_quiz 
+                    (news_id, newsquiz_content, newsquiz_choice_a, newsquiz_choice_b, 
+                    newsquiz_choice_c, newsquiz_choice_d, newsquiz_correct_ans, 
+                    newsquiz_score, newsquiz_level, reason)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    news_id,
+                    quiz["newsquiz_content"],
+                    quiz["newsquiz_choice_a"],
+                    quiz["newsquiz_choice_b"],
+                    quiz["newsquiz_choice_c"],
+                    quiz["newsquiz_choice_d"],
+                    quiz["newsquiz_correct_ans"],
+                    quiz["newsquiz_score"],
+                    quiz["newsquiz_level"],
+                    quiz["reason"]
+                ))
+                saved_count += 1
+            except Exception as quiz_err:
+                logger.error(f"퀴즈 항목 저장 중 오류: {quiz_err}")
+                # 하나의 퀴즈 저장 오류가 전체 처리를 중단하지 않도록 함
         
         conn.commit()
-        logger.info(f"기사 ID {news_id}에 대한 {len(quiz_data['quizzes'])}개 퀴즈 저장 완료")
+        logger.info(f"기사 ID {news_id}에 대한 {saved_count}개 퀴즈 저장 완료")
         
         cursor.close()
         conn.close()
         
-        return True
+        return saved_count
         
     except Exception as e:
         logger.error(f"퀴즈 데이터베이스 저장 중 오류 발생: {e}")
-        return False
+        return 0
 
 def generate_and_save_quizzes(news_ids):
-    """기사 ID 목록에 대해 요약/키워드 추출 및 퀴즈 생성 처리"""
+    """기사 ID 목록에 대해 요약/키워드 추출 및 퀴즈 생성 처리 - 기사당 최소 3개의 퀴즈 생성"""
     if not news_ids:
         logger.warning("처리할 기사가 없습니다.")
         return
@@ -580,6 +857,8 @@ def generate_and_save_quizzes(news_ids):
         )
         
         cursor = conn.cursor()
+        processed_count = 0
+        quiz_count = 0
         
         # 각 뉴스 기사에 대해 처리
         for news_id in news_ids:
@@ -600,63 +879,50 @@ def generate_and_save_quizzes(news_ids):
             if processed_data:
                 # 요약문과 키워드 저장
                 update_news_with_claude_data(news_id, processed_data)
+                processed_count += 1
+                logger.info(f"기사 ID {news_id} 요약 및 키워드 저장 완료")
             else:
                 logger.warning(f"기사 ID {news_id}에 대한 요약 및 키워드 추출 실패")
-                continue
-            
-            # 2. 퀴즈 생성
+                # 실패하더라도 계속 진행
+                
+            # 2. 퀴즈 생성 (최소 3개 이상)
             logger.info(f"기사 ID {news_id} 퀴즈 생성 시작...")
             quiz_data = generate_quiz_with_claude(news_id, title, description)
             
-            if quiz_data:
+            # 최대 3회까지 재시도
+            retry_count = 0
+            while (not quiz_data or 
+                   "quizzes" not in quiz_data or 
+                   len(quiz_data["quizzes"]) < 3) and retry_count < 3:
+                logger.warning(f"기사 ID {news_id}에 대한 퀴즈 생성 부족. 재시도 {retry_count+1}/3...")
+                time.sleep(2)  # API 요청 중간에 짠시 대기
+                quiz_data = generate_quiz_with_claude(news_id, title, description)
+                retry_count += 1
+            
+            if quiz_data and "quizzes" in quiz_data and len(quiz_data["quizzes"]) > 0:
                 # 퀴즈 저장
-                save_quiz_to_database(news_id, quiz_data)
+                saved_quizzes = save_quiz_to_database(news_id, quiz_data)
+                quiz_count += saved_quizzes
+                logger.info(f"기사 ID {news_id}에 대한 {saved_quizzes}개 퀴즈 저장 완료")
             else:
-                logger.warning(f"기사 ID {news_id}에 대한 퀴즈 생성 실패")
+                logger.error(f"기사 ID {news_id}에 대한 퀴즈 생성 실패 (최대 재시도 후)")
                 
-            # API 호출 제한 에 경출
-            time.sleep(1)
+            # API 호출 제한 때문에 짠시 시간 대기
+            time.sleep(2)
         
         cursor.close()
         conn.close()
+        
+        logger.info(f"총 {len(news_ids)}개 기사 중 {processed_count}개 요약/키워드 처리, {quiz_count}개 퀴즈 생성 완료")
         
     except Exception as e:
         logger.error(f"퀴즈 생성 및 저장 중 오류 발생: {e}")
-
-def cleanup_database():
-    """기존 데이터베이스 데이터 초기화"""
-    try:
-        conn = pymysql.connect(
-            host=DB_IP,
-            user=DB_USERNAME,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            charset='utf8mb4'
-        )
-        
-        cursor = conn.cursor()
-        
-        # 테이블 초기화
-        cursor.execute('DELETE FROM news_quiz')
-        cursor.execute('DELETE FROM news')
-        
-        conn.commit()
-        logger.info("데이터베이스 테이블 초기화 완료")
-        
-        cursor.close()
-        conn.close()
-        
-    except Exception as e:
-        logger.error(f"데이터베이스 초기화 중 오류 발생: {e}")
 
 def main():
     """메인 ETL 프로세스"""
     logger.info("=== 뉴스 ETL 파이프라인 시작 ===")
     
     try:
-        # 0. 데이터베이스 초기화 (사용자 요청에 따라)
-        cleanup_database()
-        
         # 1. 네이버 뉴스 수집
         naver_df = fetch_naver_news()
         logger.info(f"네이버 뉴스 {len(naver_df)}개 수집 완료")

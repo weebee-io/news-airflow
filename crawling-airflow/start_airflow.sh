@@ -20,7 +20,8 @@ $HOME/Desktop/final-project/weebee/crawling_venv/bin/airflow db init
 #   --password admin
 
 # Airflow 웹서버 시작
-nohup $HOME/Desktop/final-project/weebee/crawling_venv/bin/airflow webserver --port 8080 &> $AIRFLOW_HOME/logs/webserver.log &
+nohup $HOME/Desktop/final-project/weebee/crawling_ve
+nv/bin/airflow webserver --port 8080 &> $AIRFLOW_HOME/logs/webserver.log &
 echo "Airflow 웹서버가 시작되었습니다. 로그는 $AIRFLOW_HOME/logs/webserver.log 에서 확인할 수 있습니다."
 
 # Airflow 스케줄러 시작

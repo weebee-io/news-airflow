@@ -10,6 +10,7 @@ News ETL DAG for Airflow
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+import pandas as pd
 
 # DAG 기본 인수 설정
 default_args = {
@@ -28,7 +29,7 @@ dag = DAG(
     'news_etl_pipeline',
     default_args=default_args,
     description='금융/경제 뉴스 수집, 처리, 퀴즈 생성 파이프라인',
-    schedule_interval='0 */12 * * *',  # 12시간마다 실행 (0시, 12시)
+    schedule_interval='0 */6 * * *',
     catchup=False,
     tags=['news', 'etl', 'finance'],
 )
@@ -43,7 +44,6 @@ sys.path.append(current_dir)
 
 # 필요한 함수 임포트
 from news_etl import (
-    cleanup_database,
     fetch_naver_news,
     fetch_firecrawl_news,
     process_news_data,
@@ -51,31 +51,45 @@ from news_etl import (
     generate_and_save_quizzes
 )
 
-# 0. 데이터베이스 초기화 태스크
-def cleanup_database_task(**kwargs):
-    """기존 뉴스 및 퀴즈 데이터 삭제 (초기화)"""
-    print("데이터베이스 초기화 시작...")
-    cleanup_database()
-    print("데이터베이스 초기화 완료")
-    return True
-
 # 1. 네이버 뉴스 수집 태스크
 def collect_naver_news_task(**kwargs):
     """네이버 뉴스 API를 통해 금융/경제 관련 뉴스 수집"""
     print("네이버 뉴스 수집 시작...")
-    naver_df = fetch_naver_news()
-    kwargs['ti'].xcom_push(key='naver_news_df', value=naver_df.to_json(orient='records'))
-    print(f"네이버 뉴스 {len(naver_df)}개 수집 완료")
-    return len(naver_df)
+    try:
+        naver_df = fetch_naver_news("금융")  # "금융" 쿼리 추가
+        if naver_df.empty:
+            print("수집된 네이버 뉴스가 없습니다.")
+            kwargs['ti'].xcom_push(key='naver_news_df', value='[]')
+            return pd.DataFrame()
+        kwargs['ti'].xcom_push(key='naver_news_df', value=naver_df.to_json(orient='records'))
+        print(naver_df.head(1))
+        print(f"네이버 뉴스 {len(naver_df)}개 수집 완료")
+        return naver_df
+    except Exception as e:
+        print(f"네이버 뉴스 수집 중 오류: {e}")
+        kwargs['ti'].xcom_push(key='naver_news_df', value='[]')
+        return pd.DataFrame()
 
 # 2. Firecrawl 뉴스 수집 태스크
 def collect_firecrawl_news_task(**kwargs):
     """Firecrawl API를 통해 금융/경제 관련 글로벌 뉴스 수집"""
     print("Firecrawl 뉴스 수집 시작...")
-    firecrawl_df = fetch_firecrawl_news()
-    kwargs['ti'].xcom_push(key='firecrawl_news_df', value=firecrawl_df.to_json(orient='records'))
-    print(f"Firecrawl 뉴스 {len(firecrawl_df)}개 수집 완료")
-    return len(firecrawl_df)
+    try:
+        firecrawl_df = fetch_firecrawl_news()
+        if not firecrawl_df.empty:
+            kwargs['ti'].xcom_push(key='firecrawl_news_df', value=firecrawl_df.to_json(orient='records'))
+            print(f"Firecrawl 뉴스 {len(firecrawl_df)}개 수집 완료")
+            return firecrawl_df
+        else:
+            print("수집된 Firecrawl 뉴스가 없습니다.")
+            # 빈 JSON 문자열 전달 (빈 DataFrame 대신)
+            kwargs['ti'].xcom_push(key='firecrawl_news_df', value='[]')
+            return pd.DataFrame()
+    except Exception as e:
+        print(f"Firecrawl 뉴스 수집 중 오류: {e}")
+        # 오류 발생 시 빈 JSON 문자열 전달
+        kwargs['ti'].xcom_push(key='firecrawl_news_df', value='[]')
+        return pd.DataFrame()
 
 # 3. 뉴스 데이터 처리 태스크
 def process_news_task(**kwargs):
@@ -90,8 +104,26 @@ def process_news_task(**kwargs):
     naver_df = pd.read_json(naver_news_json, orient='records') if naver_news_json else pd.DataFrame()
     firecrawl_df = pd.read_json(firecrawl_news_json, orient='records') if firecrawl_news_json else pd.DataFrame()
     
+    # 필드 이름 통일 (link가 없으면 url 사용, url이 없으면 link 사용)
+    if not naver_df.empty:
+        if 'link' not in naver_df.columns and 'url' in naver_df.columns:
+            naver_df['link'] = naver_df['url']
+        elif 'url' not in naver_df.columns and 'link' in naver_df.columns:
+            naver_df['url'] = naver_df['link']
+            
+    if not firecrawl_df.empty:
+        if 'link' not in firecrawl_df.columns and 'url' in firecrawl_df.columns:
+            firecrawl_df['link'] = firecrawl_df['url']
+        elif 'url' not in firecrawl_df.columns and 'link' in firecrawl_df.columns:
+            firecrawl_df['url'] = firecrawl_df['link']
+    
     # 데이터 합치기
-    combined_df = pd.concat([naver_df, firecrawl_df], ignore_index=True).drop_duplicates(subset=['link'])
+    # URL 중복 제거를 위한 컬럼 결정
+    dedup_col = 'link' if ('link' in naver_df.columns or 'link' in firecrawl_df.columns) else 'url'
+    
+    combined_df = pd.concat([naver_df, firecrawl_df], ignore_index=True)
+    if not combined_df.empty and dedup_col in combined_df.columns:
+        combined_df = combined_df.drop_duplicates(subset=[dedup_col])
     print(f"총 {len(combined_df)}개 뉴스 처리 시작")
     
     if combined_df.empty:
@@ -99,10 +131,23 @@ def process_news_task(**kwargs):
         return 0
     
     # 뉴스 데이터 처리
+    # processed_df = process_news_data(combined_df)
+    # kwargs['ti'].xcom_push(key='processed_news_df', value=processed_df.to_json(orient='records'))
+
+    # 뉴스 데이터 처리
     processed_df = process_news_data(combined_df)
+
+    # 중복 컬럼 제거 (안전하게)
+    processed_df = processed_df.loc[:, ~processed_df.columns.duplicated()]
+
+    # 디버깅용 출력
+    print(f"데이터프레임 컬럼: {processed_df.columns.tolist()}")
+    print(f"뉴스 데이터 처리 완료: {len(processed_df)}개")
+
+    # JSON 문자열로 변환해 XCom에 저장
     kwargs['ti'].xcom_push(key='processed_news_df', value=processed_df.to_json(orient='records'))
     print(f"뉴스 데이터 처리 완료: {len(processed_df)}개")
-    return len(processed_df)
+    return processed_df
 
 # 4. 데이터베이스 저장 태스크
 def save_to_database_task(**kwargs):
@@ -123,7 +168,7 @@ def save_to_database_task(**kwargs):
     news_ids = save_news_to_database(processed_df)
     kwargs['ti'].xcom_push(key='news_ids', value=news_ids)
     print(f"뉴스 {len(news_ids)}개 데이터베이스 저장 완료")
-    return len(news_ids)
+    return news_ids
 
 # 5. 퀴즈 생성 및 저장 태스크
 def generate_quizzes_task(**kwargs):
@@ -139,50 +184,39 @@ def generate_quizzes_task(**kwargs):
     print(f"{len(news_ids)}개 뉴스에 대한 퀴즈 생성 시작")
     generate_and_save_quizzes(news_ids)
     print("퀴즈 생성 및 저장 완료")
-    return len(news_ids)
+    return news_ids
 
-# DAG에 태스크 추가
-cleanup_db = PythonOperator(
-    task_id='cleanup_database',
-    python_callable=cleanup_database_task,
-    provide_context=True,
-    dag=dag,
-)
+# DAG에 태스크 추가 (데이터베이스 초기화 태스크 제거)
 
 collect_naver_news = PythonOperator(
     task_id='collect_naver_news',
     python_callable=collect_naver_news_task,
-    provide_context=True,
     dag=dag,
 )
 
 collect_firecrawl_news = PythonOperator(
     task_id='collect_firecrawl_news',
     python_callable=collect_firecrawl_news_task,
-    provide_context=True,
     dag=dag,
 )
 
 process_news = PythonOperator(
     task_id='process_news',
     python_callable=process_news_task,
-    provide_context=True,
     dag=dag,
 )
 
 save_to_database = PythonOperator(
     task_id='save_to_database',
     python_callable=save_to_database_task,
-    provide_context=True,
     dag=dag,
 )
 
 generate_quizzes = PythonOperator(
     task_id='generate_quizzes',
     python_callable=generate_quizzes_task,
-    provide_context=True,
     dag=dag,
 )
 
-# 태스크 의존성 설정
-cleanup_db >> [collect_naver_news, collect_firecrawl_news] >> process_news >> save_to_database >> generate_quizzes
+# 태스크 의존성 설정 (데이터베이스 초기화 태스크 제거)
+[collect_naver_news, collect_firecrawl_news] >> process_news >> save_to_database >> generate_quizzes
