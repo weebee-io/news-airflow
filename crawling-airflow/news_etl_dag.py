@@ -27,7 +27,7 @@ default_args = {
 
 # DAG 정의
 dag = DAG(
-    'news_etl_pipeline',
+    'news_etl_pipeline_yeonji',
     default_args=default_args,
     description='금융/경제 뉴스 수집, 처리, 퀴즈 생성 파이프라인',
     schedule_interval='0 */6 * * *',  # 6시간마다 실행 (0시, 6시, 12시, 18시)
@@ -44,7 +44,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 # 필요한 함수 임포트
-from news_etl import (
+from news_etl_yeonji import (
     fetch_deepsearch_news,
     fetch_firecrawl_news,
     save_news_to_database,
