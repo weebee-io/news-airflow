@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 import pandas as pd
+# 로깅 대신 print 사용
 
 # DAG 기본 인수 설정
 default_args = {
@@ -29,7 +30,7 @@ dag = DAG(
     'news_etl_pipeline',
     default_args=default_args,
     description='금융/경제 뉴스 수집, 처리, 퀴즈 생성 파이프라인',
-    schedule_interval='0 */6 * * *',
+    schedule_interval='0 */6 * * *',  # 6시간마다 실행 (0시, 6시, 12시, 18시)
     catchup=False,
     tags=['news', 'etl', 'finance'],
 )
@@ -44,29 +45,28 @@ sys.path.append(current_dir)
 
 # 필요한 함수 임포트
 from news_etl import (
-    fetch_naver_news,
+    fetch_deepsearch_news,
     fetch_firecrawl_news,
-    process_news_data,
     save_news_to_database,
     generate_and_save_quizzes
 )
 
-# 1. 네이버 뉴스 수집 태스크
+# 1. deepsearch 뉴스 수집 태스크
 def collect_naver_news_task(**kwargs):
-    """네이버 뉴스 API를 통해 금융/경제 관련 뉴스 수집"""
-    print("네이버 뉴스 수집 시작...")
+    """deepsearch News RSS 피드를 통해 금융/경제 관련 뉴스 수집"""
+    print("deepsearch 뉴스 수집 시작...")
     try:
-        naver_df = fetch_naver_news("금융")  # "금융" 쿼리 추가
-        if naver_df.empty:
-            print("수집된 네이버 뉴스가 없습니다.")
+        deepsearch_df = fetch_deepsearch_news()  
+        if deepsearch_df.empty:
+            print("수집된 deepsearch 뉴스가 없습니다.")
             kwargs['ti'].xcom_push(key='naver_news_df', value='[]')
             return pd.DataFrame()
-        kwargs['ti'].xcom_push(key='naver_news_df', value=naver_df.to_json(orient='records'))
-        print(naver_df.head(1))
-        print(f"네이버 뉴스 {len(naver_df)}개 수집 완료")
-        return naver_df
+        kwargs['ti'].xcom_push(key='naver_news_df', value=deepsearch_df.to_json(orient='records'))
+        print(deepsearch_df.head(1))
+        print(f"deepsearch 뉴스 {len(deepsearch_df)}개 수집 완료")
+        return deepsearch_df
     except Exception as e:
-        print(f"네이버 뉴스 수집 중 오류: {e}")
+        print(f"deepsearch 뉴스 수집 중 오류: {e}")
         kwargs['ti'].xcom_push(key='naver_news_df', value='[]')
         return pd.DataFrame()
 
@@ -135,7 +135,7 @@ def process_news_task(**kwargs):
     # kwargs['ti'].xcom_push(key='processed_news_df', value=processed_df.to_json(orient='records'))
 
     # 뉴스 데이터 처리
-    processed_df = process_news_data(combined_df)
+    processed_df = combined_df
 
     # 중복 컬럼 제거 (안전하게)
     processed_df = processed_df.loc[:, ~processed_df.columns.duplicated()]
