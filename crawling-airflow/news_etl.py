@@ -8,6 +8,7 @@ News ETL Pipeline
 3. Claude API를 사용하여 뉴스 전처리 및 퀴즈 생성
 4. AWS RDS에 데이터 저장
 """
+
 import requests
 import pandas as pd
 from newspaper import Article  # newspaper 라이브러리 import 추가
@@ -22,6 +23,10 @@ from functools import wraps
 import pymysql
 import time
 import hashlib
+import feedparser
+import pandas as pd
+import time
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +47,6 @@ DB_IP = os.getenv('DB_IP')
 DB_NAME = os.getenv('DB_NAME')
 DB_USERNAME = os.getenv('DB_USERNAME')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
-DEEPSEARCH_API_KEY = os.getenv('DEEPSEARCH_API_KEY')
 # 유틸리티 함수
 
 @contextmanager
@@ -88,7 +92,7 @@ def call_claude_api(prompt, max_tokens=1000, temperature=0.0):
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
         message = client.messages.create(
-            model="claude-3-7-sonnet-20250219",
+            model="claude-3-5-sonnet-20241022",
             max_tokens=max_tokens,
             temperature=temperature,
             messages=[
@@ -122,10 +126,145 @@ def call_claude_api(prompt, max_tokens=1000, temperature=0.0):
         logger.error(f"Claude API 호출 중 오류: {e}")
         return None
 
+def clean_article_text(text):
+    """기사 텍스트에서 불필요한 내용 제거"""
+    if not text:
+        return text
+        
+    # 제거할 패턴 목록
+    patterns_to_remove = [
+        r"이미지=.*?(\n|$)",  # '이미지=챗GPT 4o' 등의 패턴
+        r"/게티이미지뱅크.*?(\n|$)",  # '/게티이미지뱅크' 패턴
+        r"\(사진=.*?\)",  # '(사진=...)' 패턴
+        r"사진=.*?(\n|$)",  # '사진=...' 패턴
+        r"자료=.*?(\n|$)",  # '자료=...' 패턴
+        r"자료사진=.*?(\n|$)",  # '자료사진=...' 패턴
+        r"제공=.*?(\n|$)",  # '제공=...' 패턴
+        r"출처=.*?(\n|$)",  # '출처=...' 패턴
+        r"그래픽=.*?(\n|$)",  # '그래픽=...' 패턴
+        r"편집=.*?(\n|$)",  # '편집=...' 패턴
+        r"기자 = .*?(\n|$)",  # '기자 = ...' 패턴
+        r"기자=.*?(\n|$)",  # '기자=...' 패턴
+        r".*?뉴스티앤티.*?(\n|$)",  # '...뉴스티앤티' 패턴
+        r"\[.*?\] ",  # '[태그]' 형태의 태그
+        r"\(.*?\) ",  # '(태그)' 형태의 태그
+        r"【.*?】",  # '【태그】' 형태의 태그
+        r"\n\s*\n+"  # 연속된 빈 줄을 하나로 통합
+    ]
+    
+    import re
+    # 각 패턴을 순차적으로 적용하여 텍스트 정리
+    cleaned_text = text
+    for pattern in patterns_to_remove:
+        cleaned_text = re.sub(pattern, '\n', cleaned_text)
+    
+    # 연속된 공백 제거 및 공백 정리
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+    
+    # 시작과 끝의 공백 제거
+    cleaned_text = cleaned_text.strip()
+    
+    return cleaned_text
+
+def translate_text_with_claude(text, source_lang='en', target_lang='ko'):
+    """Claude API를 사용하여 텍스트를 번역"""
+    if not text or len(text.strip()) < 10:
+        return text
+
+    try:
+        prompt = f"""
+        당신은 전문 번역가입니다. 아래 {source_lang} 텍스트를 자연스러운 {target_lang}로 번역해주세요.
+        원문의 의미와 뉘앙스를 정확히 유지하면서, 목표 언어의 자연스러운 표현으로 번역하는 것이 중요합니다.
+        금융/경제 용어는 한국에서 통용되는 전문 용어로 정확하게 번역해주세요.
+        
+        원문:
+        """
+        prompt += text[:10000]  # 길이 제한
+        prompt += """
+        
+        번역문만 제공해주세요. 다른 설명이나 주석은 포함하지 마세요.
+        """
+        
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4000,
+            temperature=0.0,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # 전체 응답을 번역문으로 사용
+        translated_text = message.content[0].text.strip()
+        return translated_text
+        
+    except Exception as e:
+        logger.error(f"번역 중 오류 발생: {e}")
+        return text  # 오류 발생 시 원본 반환
+        
+def translate_text_with_claude_combined(title, content, source_lang='en', target_lang='ko'):
+    """Claude API를 사용하여 제목과 내용을 하나의 호출로 번역"""
+    if not title and not content:
+        return title, content
+        
+    content_to_translate = content[:3000] if len(content) > 3000 else content
+    
+    try:
+        prompt = f"""
+        당신은 금융/경제 전문 번역가입니다. 아래 {source_lang} 제목과 내용을 자연스러운 {target_lang}로 번역해주세요.
+        원문의 의미와 뉘앙스를 정확히 유지하면서, 목표 언어의 자연스러운 표현으로 번역하는 것이 중요합니다.
+        금융/경제 용어는 한국에서 통용되는 전문 용어로 정확하게 번역해주세요.
+        
+        제목: {title}
+        내용: {content_to_translate}
+        
+        다음 JSON 형식으로만 응답해주세요:
+        {{
+            "translated_title": "번역된 제목",
+            "translated_content": "번역된 내용"
+        }}
+        """
+        
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=4000,
+            temperature=0.0,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # JSON 형식 추출
+        response_text = message.content[0].text
+        json_start = response_text.find('{')
+        json_end = response_text.rfind('}')
+        
+        if json_start == -1 or json_end == -1:
+            logger.error("번역 결과에서 JSON 형식을 찾을 수 없습니다.")
+            return title, content
+            
+        json_str = response_text[json_start:json_end+1]
+        
+        try:
+            result = json.loads(json_str)
+            translated_title = result.get("translated_title", title)
+            translated_content = result.get("translated_content", content)
+            return translated_title, translated_content
+        except json.JSONDecodeError as json_err:
+            logger.error(f"번역 결과 JSON 파싱 오류: {json_err}")
+            return title, content
+            
+    except Exception as e:
+        logger.error(f"통합 번역 중 오류 발생: {e}")
+        return title, content  # 오류 발생 시 원본 반환
+
 def fetch_news_from_api():
     logger.info("뉴스 데이터 수집 시작")
     
-    # 최근 12시간 기준으로 시간 설정
     now = datetime.now()
     
     logger.info(f"뉴스 수집: {now.strftime('%Y-%m-%d %H:%M')}")
@@ -134,17 +273,17 @@ def fetch_news_from_api():
     results = []
     
     try:
-        # deepsearch에서 뉴스 수집 (네이버 뉴스 대체)
-        deepsearch_news = fetch_deepsearch_news()
-        if not deepsearch_news.empty:
-            logger.info(f"Google 뉴스: {len(deepsearch_news)}개 수집")
-            results.append(deepsearch_news)
+        # eng_rss에서 뉴스 수집 (네이버 뉴스 대체)
+        kor_rss_news = fetch_kor_rss_news()
+        if not kor_rss_news.empty:
+            logger.info(f"kor_rss 뉴스: {len(kor_rss_news)}개 수집")
+            results.append(kor_rss_news)
         
         # 추가 뉴스 소스도 같은 방식으로 수정
-        firecrawl_news = fetch_firecrawl_news()
-        if not firecrawl_news.empty:
-            logger.info(f"Firecrawl 뉴스: {len(firecrawl_news)}개 수집")
-            results.append(firecrawl_news)
+        eng_rss_news = fetch_eng_rss_news()
+        if not eng_rss_news.empty:
+            logger.info(f"Firecrawl 뉴스: {len(eng_rss_news)}개 수집")
+            results.append(eng_rss_news)
         
     except Exception as e:
         logger.error(f"뉴스 수집 중 오류: {e}")
@@ -160,166 +299,178 @@ def fetch_news_from_api():
     
     return combined_df
 
-def fetch_firecrawl_news():
-    """Firecrawl API를 통해 금융/경제 관련 글로벌 뉴스 수집 - 필터링 없이"""
-    logger.info("Firecrawl API 데이터 수집 시작")
-    
-    if not FIRECRAWL_API_KEY:
-        logger.error("Firecrawl API 키가 설정되지 않았습니다.")
-        return pd.DataFrame()
-    
-    url = "https://api.firecrawl.dev/search"
-    headers = {
-        "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    # 검색어 리스트 (영어) - 간단한 금융 키워드로 변경
-    search_terms = [
-        "finance news", "economic news", "stock market", "investment news", "banking news", 
-        "global economy", "financial markets", "trading", "bonds", "currency", "cryptocurrency",
-        "financial education", "monetary policy", "inflation", "financial literacy", "market analysis"
+def fetch_eng_rss_news():
+    """CNBC
+    eng_rss 피드를 통해 금융/경제 관련 뉴스 수집 및 한국어 번역"""
+    import requests
+    import pandas as pd
+
+    # CNBC RSS 피드 URL 목록
+    rss_urls = [
+        'https://www.cnbc.com/id/20910258/device/rss/rss.html',  # Finance
+        'https://www.cnbc.com/id/10000664/device/rss/rss.html',  # Markets
+        'https://www.cnbc.com/id/10000115/device/rss/rss.html',  # Economy
     ]
-    
+        
+    # 기사 본문 가져오는 함수
+    def get_article_content(url):
+        try:
+            article = Article(url, language='en')
+            article.download()
+            article.parse()
+            return article.text.strip()
+        except Exception as e:
+            print(f"[오류] {url}: {e}")
+            return ''
+
+    # 모든 피드에서 뉴스 수집
     news_items = []
     
-    for term in search_terms:
-        payload = {
-            "query": term,
-            "num_results": 20,
-            "time_period": "day",  # API 제한으로 12시간이 없어 day 사용 후 코드에서 필터링
-            "search_type": "news"
-        }
+    for rss_url in rss_urls:
+        # RSS 피드 파싱
+        feed = feedparser.parse(rss_url)
         
+        # 파싱 결과를 리스트로 변환
+        for entry in feed.entries:
+            title = entry.title
+            link = entry.link
+            published = datetime(*entry.published_parsed[:6]) if 'published_parsed' in entry else None
+            summary = entry.summary if 'summary' in entry else ''
+            
+            # 기사 본문 크롤링
+            content = get_article_content(link)
+            
+            # 불필요한 텍스트 제거
+            content = clean_article_text(content)
+            
+            # 중요 금융/경제 키워드 목록
+            important_keywords = ['economy', 'market', 'finance', 'stock', 'investment', 'bond', 'interest rate', 
+                                'inflation', 'fed', 'federal reserve', 'nasdaq', 'dow jones', 'earnings', 'treasury',
+                                'gdp', 'recession', 'banking', 'crypto', 'currency']
+                                
+            # 제목이나 내용에 중요 키워드가 포함된 경우에만 번역
+            should_translate = len(content) > 200 and any(keyword in title.lower() or keyword in content.lower()[:500] 
+                                                          for keyword in important_keywords)
+                                                          
+            if should_translate:  # 중요 키워드가 있고 충분한 내용이 있는 경우만 번역 시도
+                # 영어 원문 보존
+                original_content = content
+                
+                # 제목과 내용을 한번에 번역
+                logger.info(f"CNBC 기사 번역 시작: {title[:30]}...")
+                translated_title, translated_content = translate_text_with_claude_combined(title, content, 'en', 'ko')
+                
+                # 번역 결과 사용
+                title = translated_title
+                description = translated_content
+                
+                # 원문도 저장 (필요 시 사용)
+                summary = f"[원문] {original_content[:500]}..."
+            else:
+                description = content
+                
+            created_at = datetime.now()
+            source = 'CNBC'
+            
+            # 해시 생성 (기사 원문 기준)
+            article_hash = hashlib.sha1(description.encode('utf-8')).hexdigest()[:45]
+
+            news_items.append({
+                'created_at': created_at,
+                'description': description,
+                'published_date': published,
+                'source': source,
+                'title': title,
+                'url': link,
+                'summary': summary,
+                'article_hash': article_hash
+            })
+
+            time.sleep(1)  # 과도한 요청 방지
+
+    # DataFrame 생성
+    df = pd.DataFrame(news_items)
+
+    # 전처리: description이 비어있거나 중복된 기사 제거
+    df = df[df['description'].str.strip() != '']
+    df = df.drop_duplicates(subset=['article_hash'])
+    df = df.tail(10) ############### 나중에 변경 - 각 피드에서 1개씩 테스트
+    return df
+
+
+def fetch_kor_rss_news():
+    """kor_rss 피드를 통해 금융/경제 관련 뉴스 수집"""
+    import requests
+    import pandas as pd
+
+    # 한국경제 RSS 피드 URL 목록
+    rss_urls = [
+        'https://www.hankyung.com/feed/economy',     # 경제
+        'https://www.hankyung.com/feed/realestate',  # 부동산
+        'https://www.hankyung.com/feed/finance',     # 금융
+    ]
+        
+    # 기사 본문 가져오는 함수
+    def get_article_content(url):
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "results" in data and data["results"]:
-                logger.info(f"'{term}' 검색어로 {len(data['results'])}개 뉴스 항목 수집")
-                
-                for item in data["results"]:
-                    # 발행일 파싱 및 최근 12시간 이내 뉴스인지 확인
-                    published_date = item.get("published_date", "")
-                    is_recent = True
-                    
-                    if published_date:
-                        try:
-                            # Firecrawl API의 일반적인 날짜 형식은 ISO 8601 (예: 2024-05-27T09:30:00Z)
-                            pub_datetime = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
-                            time_diff = datetime.now(tz=pub_datetime.tzinfo) - pub_datetime
-                            is_recent = time_diff.total_seconds() <= 12 * 3600  # 12시간을 초로 변환
-                            
-                            if not is_recent:
-                                logger.debug(f"12시간 이상 지난 Firecrawl 기사 제외: {item.get('title', '')}, 발행일: {published_date}")
-                                continue
-                        except Exception as e:
-                            logger.warning(f"Firecrawl 발행일 파싱 오류: {e}. 현재 시간 사용")
-                    
-                    news_items.append({
-                        "title": item.get("title", ""),
-                        "description": item.get("snippet", ""),
-                        "link": item.get("url", ""),
-                        "pubDate": published_date,
-                        "source": item.get("source", "")
-                    })
-            else:
-                logger.warning(f"'{term}' 검색어로 뉴스를 찾을 수 없습니다.")
-                
-            # API 호출 간 딜레이
-            time.sleep(1)
-            
+            article = Article(url, language='ko')
+            article.download()
+            article.parse()
+            return article.text.strip()
         except Exception as e:
-            logger.error(f"Firecrawl API 호출 중 오류 발생: {e}")
+            print(f"[오류] {url}: {e}")
+            return ''
+
+    # 모든 피드에서 뉴스 수집
+    news_items = []
     
-    # 결과를 DataFrame으로 변환
-    if news_items:
-        df = pd.DataFrame(news_items)
-        # 중복 제거
-        df = df.drop_duplicates(subset=['link'])
+    for rss_url in rss_urls:
+        # RSS 피드 파싱
+        feed = feedparser.parse(rss_url)
         
-        # 금융/경제 관련 필터링
-        finance_keywords = [
-            'finance', 'economic', 'stock', 'invest', 'bank', 'market', 'trading', 
-            'bond', 'currency', 'crypto', 'financial', 'monetary', 'inflation', 
-            'economy', 'fund', 'asset', 'wealth', 'money', 'tax'
-        ]
-        
-        # 제목이나 설명에 금융/경제 키워드가 포함된 뉴스만 필터링
-        pattern = '|'.join(finance_keywords)
-        mask = (df['title'].str.contains(pattern, case=False, na=False) | 
-                df['description'].str.contains(pattern, case=False, na=False))
-        filtered_df = df[mask]
-        
-        if len(filtered_df) > 0:
-            logger.info(f"총 {len(df)}개 중 {len(filtered_df)}개 금융/경제 관련 뉴스 필터링 완료")
-            return filtered_df
-        else:
-            logger.warning("금융/경제 관련 뉴스가 필터링 후 없습니다. 전체 뉴스 반환")
-            return df
-    else:
-        logger.warning("수집된 뉴스가 없습니다.")
-        return pd.DataFrame()
-
-def fetch_deepsearch_news():
-        """deepsearch 피드를 통해 금융/경제 관련 뉴스 수집"""
-        import requests
-        import pandas as pd
-
-        
-        # 오늘 날짜
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        # 내일 날짜
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        # API 요청 URL 및 헤더
-        url = "https://api-v2.deepsearch.com/v1/articles/economy,society"
-        params = {
-            "date_from": today,
-            "date_to": tomorrow,
-            "api_key": DEEPSEARCH_API_KEY
-        }
-
-        # API 호출
-        response = requests.get(url, params=params)
-
-        # 응답이 성공했는지 확인
-        if response.status_code == 200:
-            data = response.json()
+        # 파싱 결과를 리스트로 변환 (각 피드당 최대 2개씩)
+        for entry in feed.entries[:2]:
+            title = entry.title
+            link = entry.link
+            summary = entry.summary if 'summary' in entry else ''
             
-            # articles 키가 존재하는 경우 해당 데이터를 DataFrame으로 변환
-            if "data" in data:
-                df = pd.DataFrame(data["data"])
-                # print(df.head())  # 결과 확인용
-            else:
-                print("응답에 'data' 키가 없습니다.")
-        else:
-            print(f"요청 실패: {response.status_code} - {response.text}")
+            # 기사 본문 크롤링
+            content = get_article_content(link)
+            
+            # 불필요한 텍스트 제거
+            description = clean_article_text(content)
+            if hasattr(entry, 'published'):
+                try:
+                    published_date = datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S %z")
+                    published_date = published_date.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception as e:
+                    print(f"[오류] published_date 파싱 실패: {e}")
+                    published_date = None
+            source = '한국경제'
+            
+            # 해시 생성 (기사 원문 기준)
+            article_hash = hashlib.sha1(description.encode('utf-8')).hexdigest()[:45]
 
+            news_items.append({
+                'created_at': datetime.now(),
+                'description': description,
+                'published_date': published_date,
+                'source': source,
+                'title': title,
+                'url': link,
+                'summary': summary,
+                'article_hash': article_hash
+            })
+            time.sleep(1)  # 과도한 요청 방지
 
+    # DataFrame 생성
+    df = pd.DataFrame(news_items)
 
-        # 기사 본문 크롤링 함수 - 직접 originallink의 링크에 들어가서 본문을 가져오기
-        def get_article_content(url):
-            try:
-                article = Article(url, language='ko')  # 한국어 설정
-                article.download()
-                article.parse()
-                return article.text
-            except Exception as e:
-                print(f"본문 크롤링 오류 ({url}): {e}")
-                return None
+    # 전처리: description이 비어있거나 중복된 기사 제거
+    df = df[df['description'].str.strip() != '']
+    df = df.drop_duplicates(subset=['article_hash'])
+    return df
 
-        # 각 뉴스 링크에서 본문을 추출하여 df의 'content' 열에 추가
-        df = df[['id', 'sections', 'title', 'publisher', 'author', 'summary',
-            'image_url', 'content_url', 'published_at']]
-        df['description'] = df['content_url'].apply(get_article_content)
-        df = df[df['description'].str.strip() != '']  # 빈 문자열이나 공백만 있는 행 제거
-        df['created_at'] = datetime.now().isoformat()
-        df.rename(columns={'publisher': 'source', "content_url":"url", "published_at":"published_date"}, inplace=True)
-
-        return df
 
 @error_handler
 def preprocess_news_with_claude(news_id, title, description):
@@ -329,20 +480,20 @@ def preprocess_news_with_claude(news_id, title, description):
         return None
         
     prompt = f"""
-    당신은 금융/경제 뉴스 분석 전문가입니다. 다음 기사에서 가장 중요한 금융/경제 키워드를 추출하고, 요점을 정확하게 요약해주세요.
+    당신은 금융/경제 뉴스 분석 전문가입니다. 다음 기사에서 가장 중요한 금융/경제 키워드를 오직 단어로만 추출하고, 전반적인 핵심 요점을 정확하게 요약해주세요.
     
     기사 제목: {title}
     기사 내용: {description[:10000]}
     
     이 기사에서 핵심 금융/경제 키워드 5개와 내용을 2~3문장으로 정확하게 요약해주세요.
     
-    1. 키워드는 기사의 핵심 금융/경제 용어나 개념을 담고 있어야 합니다.
+    1. 각 키워드는 기사의 핵심 금융/경제 용어 및 개념을 담고 있어야 합니다.
     2. 요약은 기사의 주요 내용과 시장에 미칠 영향이나 경제적 의의를 포함해야 합니다.
     
     반드시 다음 JSON 형식으로 응답해주세요:
     {{
         "keywords": "키워드1, 키워드2, 키워드3, 키워드4, 키워드5",
-        "summary": "기사의 내용을 2~3문장으로 요약한 내용"
+        "summary": "기사의 내용을 3줄의 불릿포인트를 통해 문장으로 요약한 내용"
     }}
     
     중요: 오직 JSON 형식만 제공해주세요. 다른 텍스트나 설명은 포함하지 마세요.
@@ -382,7 +533,8 @@ def generate_quiz_with_claude(news_id, title, description):
     기사 제목: {title}
     기사 내용: {description[:10000]}
     
-    이 기사의 주요 금융/경제 개념을 이해하기 위한 객관식 퀴즈를 제작해주세요. 반드시 최소 3개 이상의 퀴즈를 제작하고, 다음 형식을 정확히 따라주세요.
+    이 기사의 주요 금융/경제 개념을 이해하기 위한 객관식 퀴즈를 제작해주세요. 반드시 최소 5개 이상의 퀴즈를 제작하고, 다음 형식을 정확히 따라주세요.
+    퀴즈의 난이도는 EASY 난이도로만 생성해주고, 금융/경제 지식이 많이 없는 학습자들이 쉽게 이해할 수 있도록 작성해주세요.
 
     다음 JSON 형식으로 응답해주세요:
     {{
@@ -433,7 +585,7 @@ def generate_quiz_with_claude(news_id, title, description):
                 if field == "newsquiz_score":
                     quiz[field] = 5  # 기본값 5
                 elif field == "newsquiz_level":
-                    quiz[field] = "NORMAL"  # 기본값 medium
+                    quiz[field] = "NORMAL"  # 기본값 NORMAL
                 elif field == "newsquiz_correct_ans":
                     quiz[field] = "A"  # 기본값 A
                 else:
@@ -462,6 +614,7 @@ def save_news_to_database(df):
     # 데이터베이스에 추가할 뉴스 ID를 저장할 목록
     inserted_news_ids = []
     total_articles = len(df)
+    print(df.published_date.head(1))
     skipped_articles = 0
     
     with get_db_connection() as conn:
@@ -482,11 +635,12 @@ def save_news_to_database(df):
             title = row['title'] if not pd.isna(row['title']) else ''
             description = row['description'] if not pd.isna(row['description']) else ''
             created_at = row['created_at'] if not pd.isna(row['created_at']) else None
+            published_date = row['published_date'] if 'published_date' in row and not pd.isna(row['published_date']) else ''
             source = row['source'] if not pd.isna(row['source']) else ''
             url = row['url'] if not pd.isna(row['url']) else ''
             keywords = row['keywords'] if 'keywords' in row and not pd.isna(row['keywords']) else ''
             summary = row['summary'] if 'summary' in row and not pd.isna(row['summary']) else ''
-            
+
             # 중복 여부 확인 (URL 및 해시 기반)
             article_hash = hashlib.md5(url.encode()).hexdigest()
             
@@ -500,10 +654,10 @@ def save_news_to_database(df):
             try:
                 cursor.execute('''
                     INSERT INTO news 
-                    (title, description, created_at, source, url, article_hash, keywords, summary)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (title, description, created_at, source, published_date, url, article_hash, keywords, summary)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
-                    title, description, created_at, source, url, article_hash, keywords, summary
+                    title, description, created_at, source, published_date, url, article_hash, keywords, summary
                 ))
                 
                 # 방금 삽입한 레코드의 ID 가져오기
@@ -645,7 +799,7 @@ def generate_and_save_quizzes(news_ids):
                    "quizzes" not in quiz_data or 
                    len(quiz_data["quizzes"]) < 3) and retry_count < 3:
                 logger.warning(f"기사 ID {news_id}에 대한 퀴즈 생성 부족. 재시도 {retry_count+1}/3...")
-                time.sleep(2)  # API 요청 중간에 짠시 대기
+                time.sleep(1)  # API 요청 중간에 짠시 대기
                 quiz_data = generate_quiz_with_claude(news_id, title, description)
                 retry_count += 1
             
@@ -658,7 +812,7 @@ def generate_and_save_quizzes(news_ids):
                 logger.error(f"기사 ID {news_id}에 대한 퀴즈 생성 실패 (최대 재시도 후)")
                 
             # API 호출 제한 때문에 짠시 시간 대기
-            time.sleep(2)
+            time.sleep(1)
         
         cursor.close()
         
